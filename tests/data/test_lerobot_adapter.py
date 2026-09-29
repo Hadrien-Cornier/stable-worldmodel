@@ -183,6 +183,9 @@ def test_item_and_chunk_behavior(tiny_root):
     torch.testing.assert_close(
         chunk[0]['action'], _expected_actions(1, [2, 3, 4])
     )
+    # A slice that starts mid-episode keeps its step and episode numbers.
+    assert chunk[0]['step_idx'].tolist() == [2, 3, 4]
+    assert chunk[0]['ep_idx'].tolist() == [1, 1, 1]
 
 
 def test_frameskip_strides_observations_and_keeps_every_action(tiny_root):
