@@ -144,7 +144,10 @@ def test_seeded_repeat_decisions_are_per_env_and_keep_last_output(world):
 
 @pytest.mark.parametrize('probability', [0, 1])
 def test_world_collect_repeats_within_episode_only(tmp_path, probability):
-    h5py = pytest.importorskip('h5py')
+    # The 'hdf5' format needs both h5py and hdf5plugin.
+    pytest.importorskip('stable_worldmodel.data.formats.hdf5')
+    import h5py
+
     world = World(
         'swm/TwoRoom-v1', num_envs=1, add_pixels=False, max_episode_steps=3
     )

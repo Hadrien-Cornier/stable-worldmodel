@@ -207,7 +207,10 @@ def _collect_first_actions(tmp_path, probability, h5py):
 
 
 def test_world_collect_starts_each_episode_fresh(tmp_path):
-    h5py = pytest.importorskip('h5py')
+    # The 'hdf5' format needs both h5py and hdf5plugin.
+    pytest.importorskip('stable_worldmodel.data.formats.hdf5')
+    import h5py
+
     no_repeat, _ = _collect_first_actions(tmp_path, 0, h5py)
     always_repeat, episodes = _collect_first_actions(tmp_path, 1, h5py)
 
