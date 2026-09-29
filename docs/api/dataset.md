@@ -256,10 +256,10 @@ ds = swm.data.load_dataset(
 !!! info ""
     LeRobot support is feature-gated to **Python 3.12+** because the upstream
     `lerobot` package requires it. Install with
-    `pip install 'stable-worldmodel[lerobot]'`. There is no `lerobot` writer —
-    mapping arbitrary `World` info dicts onto LeRobot's schema is not supported.
-    The extra also installs `lerobot[dataset]`, which LeRobot needs to read
-    Parquet data and decode video.
+    `pip install 'stable-worldmodel[lerobot]'`. The extra also installs
+    `lerobot[dataset]`, which LeRobot needs to read Parquet data and decode
+    video. There is no `lerobot` writer: mapping arbitrary `World` info dicts
+    onto LeRobot's schema is not supported.
 ///
 
 /// tab | Goal-Conditioned
