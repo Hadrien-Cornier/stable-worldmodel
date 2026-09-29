@@ -194,7 +194,7 @@ class ExpertPolicy(BasePolicy):
                 < self.action_repeat_prob
             )
             if 'step_idx' in info_dict:
-                # Reset only the history of environments starting an episode.
+                # Do not repeat for environments starting an episode.
                 repeat_mask &= (
                     np.asarray(info_dict['step_idx']).reshape(
                         repeat_mask.shape
