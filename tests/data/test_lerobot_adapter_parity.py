@@ -27,7 +27,10 @@ pytest.importorskip('lerobot')
 from _lerobot_data import VIDEO_BACKEND, offline_hf, write_dataset  # noqa: E402
 
 from stable_worldmodel.data import LeRobotAdapter  # noqa: E402
+from stable_worldmodel.data.formats import lerobot as lerobot_format  # noqa: E402
 from stable_worldmodel.data.formats.lerobot import (  # noqa: E402
+    _arrow_to_numpy,
+    _column_to_numpy,
     _episode_structure,
 )
 
@@ -216,3 +219,128 @@ def test_episode_structure_matches_the_old_code_on_random_layouts():
 def test_episode_structure_rejects_an_episode_split_in_two():
     with pytest.raises(ValueError, match='episode 0 are not contiguous'):
         _episode_structure(np.array([0, 0, 1, 0]))
+
+
+# -- Column reads -------------------------------------------------------------
+
+# Every table column of the test dataset, under an alias.
+TABLE_ALIASES = {
+    **KEY_ALIASES,
+    'timestamp': 'timestamp',
+    'frame_index': 'frame_index',
+    'episode_index': 'episode_index',
+    'index': 'index',
+    'task_index': 'task_index',
+}
+TABLE_COLUMNS = {
+    'action': 'action',
+    'proprio': 'observation.state',
+    **{
+        alias: native
+        for native, alias in TABLE_ALIASES.items()
+        if native not in CAMERAS
+    },
+}
+
+
+def _legacy_column(adapter: LeRobotAdapter, native_key: str) -> np.ndarray:
+    """The column as the old code read it: row by row through ``datasets``."""
+    return _column_to_numpy(adapter.dataset.hf_dataset[native_key])
+
+
+@pytest.mark.parametrize('episodes', [None, [2, 0]])
+def test_columns_match_the_old_row_by_row_read(multi_root, episodes):
+    adapter = _open(multi_root, episodes=episodes, key_aliases=TABLE_ALIASES)
+    for alias, native in TABLE_COLUMNS.items():
+        got = adapter.get_col_data(alias)
+        want = _legacy_column(adapter, native)
+        assert got.dtype == want.dtype, alias
+        assert got.shape == want.shape, alias
+        np.testing.assert_array_equal(got, want, err_msg=alias)
+        assert got.flags.writeable, alias
+
+
+def test_columns_without_a_numpy_layout_keep_the_old_read(
+    multi_root, monkeypatch
+):
+    monkeypatch.setattr(lerobot_format, '_numpy_layout', lambda _type: None)
+    adapter = _open(multi_root, key_aliases=TABLE_ALIASES)
+    for alias, native in TABLE_COLUMNS.items():
+        got = adapter.get_col_data(alias)
+        want = _legacy_column(adapter, native)
+        assert got.dtype == want.dtype, alias
+        np.testing.assert_array_equal(got, want, err_msg=alias)
+
+
+def test_arrow_to_numpy_matches_the_datasets_transform():
+    """Same values and dtypes as ``hf_transform_to_torch``, type by type."""
+    import datasets
+    from lerobot.datasets.io_utils import hf_transform_to_torch
+
+    n = 6
+    rng = np.random.default_rng(0)
+    values = {
+        'f16': rng.standard_normal(n).astype(np.float16),
+        'f32': rng.standard_normal(n).astype(np.float32),
+        'f64': rng.standard_normal(n),
+        'i8': rng.integers(-100, 100, n).astype(np.int8),
+        'i32': rng.integers(-1000, 1000, n).astype(np.int32),
+        'u8': rng.integers(0, 255, n).astype(np.uint8),
+        'u32': rng.integers(0, 2**31, n).astype(np.uint32),
+        'flag': rng.integers(0, 2, n).astype(bool),
+        'vec': rng.standard_normal((n, 3)).astype(np.float32),
+        'grid': rng.integers(0, 9, (n, 2, 2)).astype(np.int32),
+    }
+    value = datasets.Value
+    features = datasets.Features(
+        {
+            'f16': value('float16'),
+            'f32': value('float32'),
+            'f64': value('float64'),
+            'i8': value('int8'),
+            'i32': value('int32'),
+            'u8': value('uint8'),
+            'u32': value('uint32'),
+            'flag': value('bool'),
+            'vec': datasets.Sequence(value('float32'), length=3),
+            'grid': datasets.Sequence(
+                datasets.Sequence(value('int32'), length=2), length=2
+            ),
+        }
+    )
+    part = datasets.Dataset.from_dict(
+        {k: v.tolist() for k, v in values.items()}, features=features
+    )
+    # Two parts, so the Arrow columns have more than one chunk.
+    table = datasets.concatenate_datasets([part, part])
+    table.set_transform(hf_transform_to_torch)
+    for key in values:
+        column = table.data.column(key)
+        assert column.num_chunks == 2, key
+        want = _column_to_numpy(table[key])
+        for got in (
+            _arrow_to_numpy(column),
+            _arrow_to_numpy(column.slice(0, 2 * n)),
+        ):
+            assert got.dtype == want.dtype, key
+            assert got.shape == want.shape, key
+            np.testing.assert_array_equal(got, want, err_msg=key)
+        # A slice across the chunk boundary.
+        np.testing.assert_array_equal(
+            _arrow_to_numpy(column.slice(n - 2, 4)), want[n - 2 : n + 2]
+        )
+
+
+def test_arrow_to_numpy_leaves_other_types_to_datasets():
+    import pyarrow as pa
+
+    assert _arrow_to_numpy(pa.array(['a', 'b'])) is None
+    assert _arrow_to_numpy(pa.array([[1.0], [2.0, 3.0]])) is None
+    assert _arrow_to_numpy(pa.array([1, 2], type=pa.uint64())) is None
+    assert _arrow_to_numpy(pa.array([1.0, None])) is None
+    assert (
+        _arrow_to_numpy(
+            pa.array([[1.0, 2.0], None], type=pa.list_(pa.float32(), 2))
+        )
+        is None
+    )

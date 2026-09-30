@@ -93,6 +93,58 @@ def _episode_structure(episode_index: np.ndarray) -> _EpisodeStructure:
     )
 
 
+def _numpy_layout(arrow_type: Any) -> tuple[np.dtype, tuple[int, ...]] | None:
+    """Numpy dtype and per-row shape for a column of this Arrow type.
+
+    The dtypes are the ones LeRobot's ``hf_transform_to_torch`` gives, since
+    it calls ``torch.tensor`` on Python values: floats become float32,
+    integers int64, and booleans stay bool. Each fixed-size list adds one
+    dimension. Any other type (images, strings, variable-length lists,
+    extension types) returns ``None``.
+    """
+    import pyarrow as pa
+
+    row_shape = []
+    while pa.types.is_fixed_size_list(arrow_type):
+        row_shape.append(arrow_type.list_size)
+        arrow_type = arrow_type.value_type
+    if pa.types.is_floating(arrow_type):
+        dtype = np.float32
+    elif pa.types.is_integer(arrow_type) and arrow_type != pa.uint64():
+        dtype = np.int64
+    elif pa.types.is_boolean(arrow_type):
+        dtype = np.bool_
+    else:
+        return None
+    return np.dtype(dtype), tuple(row_shape)
+
+
+def _arrow_to_numpy(column: Any) -> np.ndarray | None:
+    """Copy an Arrow array or chunked array into a new numpy array.
+
+    Returns ``None`` when the type has no numpy layout (see
+    :func:`_numpy_layout`) or the column holds nulls. The caller then reads
+    the column through ``datasets`` instead.
+    """
+    import pyarrow as pa
+
+    layout = _numpy_layout(column.type)
+    if layout is None:
+        return None
+    dtype, row_shape = layout
+    if isinstance(column, pa.ChunkedArray):
+        column = column.combine_chunks()
+    values = column
+    for _ in row_shape:
+        if values.null_count:
+            return None
+        values = values.flatten()
+    if values.null_count:
+        return None
+    flat = np.array(values.to_numpy(zero_copy_only=False), dtype=dtype)
+    return flat.reshape((len(column), *row_shape))
+
+
 def _scalarize(value: Any) -> Any:
     if isinstance(value, torch.Tensor):
         if value.ndim == 0:
@@ -161,6 +213,8 @@ class LeRobotAdapter(Dataset):
             alias: native for native, alias in self._native_to_alias.items()
         }
         self._full_columns: dict[str, np.ndarray] = {}
+        self._arrow_columns: dict[str, Any] = {}
+        self._views: dict[str, Any] = {}
         self._cache: dict[str, np.ndarray] = {}
         self._window_datasets: dict[
             tuple[tuple[int, ...], tuple[int, ...]], Any
@@ -197,7 +251,7 @@ class LeRobotAdapter(Dataset):
 
     #: Caches that are cheap to rebuild. They are left out of the pickle
     #: that DataLoader workers receive, and each worker refills them on use.
-    _UNPICKLED_CACHES = ('_full_columns',)
+    _UNPICKLED_CACHES = ('_full_columns', '_arrow_columns', '_views')
 
     def __getstate__(self) -> dict:
         state = self.__dict__.copy()
@@ -276,9 +330,48 @@ class LeRobotAdapter(Dataset):
 
     def _get_native_column(self, native_key: str) -> np.ndarray:
         if native_key not in self._full_columns:
-            column = self.dataset.hf_dataset[native_key]
-            self._full_columns[native_key] = _column_to_numpy(column)
+            values = None
+            column = self._arrow_column(native_key)
+            if column is not None:
+                values = _arrow_to_numpy(column)
+            if values is None:
+                # Row by row through `datasets`, as before this change.
+                values = _column_to_numpy(
+                    self._column_view(native_key)[native_key]
+                )
+            self._full_columns[native_key] = values
         return self._full_columns[native_key]
+
+    def _arrow_column(self, native_key: str) -> Any:
+        """The Arrow data of a table column, or ``None``.
+
+        ``None`` means the column type has no numpy layout (see
+        :func:`_numpy_layout`), or ``hf_dataset`` has an indices mapping
+        (from ``select`` or ``shuffle``) that the Arrow table does not
+        follow. LeRobot does not use one.
+        """
+        if native_key not in self._arrow_columns:
+            hf_dataset = self.dataset.hf_dataset
+            column = None
+            if getattr(hf_dataset, '_indices', None) is None:
+                column = hf_dataset.data.column(native_key)
+                if _numpy_layout(column.type) is None:
+                    column = None
+            self._arrow_columns[native_key] = column
+        return self._arrow_columns[native_key]
+
+    def _column_view(self, native_key: str) -> Any:
+        """One-column view of ``hf_dataset``, with LeRobot's transform.
+
+        ``select_columns`` does not copy data. Reading rows of the view
+        decodes only this column, while ``hf_dataset[rows]`` decodes every
+        column, including every image.
+        """
+        if native_key not in self._views:
+            self._views[native_key] = self.dataset.hf_dataset.select_columns(
+                [native_key]
+            )
+        return self._views[native_key]
 
     def _time_offsets(self, indices: tuple[int, ...]) -> list[float]:
         return [float(idx) / self._fps for idx in indices]
