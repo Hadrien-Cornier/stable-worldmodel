@@ -145,6 +145,20 @@ class LeRobotAdapter(Dataset):
     def column_names(self) -> list[str]:
         return self._keys
 
+    #: Caches that are cheap to rebuild. They are left out of the pickle
+    #: that DataLoader workers receive, and each worker refills them on use.
+    _UNPICKLED_CACHES = ('_full_columns',)
+
+    def __getstate__(self) -> dict:
+        state = self.__dict__.copy()
+        for name in self._UNPICKLED_CACHES:
+            state[name] = {}
+        # A trainer attached as `dataset._trainer` (stable-pretraining's
+        # pattern) reaches the DataLoader iterator, which cannot be
+        # pickled. Leave it out, as LanceDataset does.
+        state['_trainer'] = None
+        return state
+
     def _get_native_keys(self) -> list[str]:
         features = self.dataset.features
         if not isinstance(features, Mapping):

@@ -1,8 +1,9 @@
 """Tests for the LeRobot dataset adapter.
 
 Each test reads a tiny LeRobot v3 dataset that the module writes to a temp
-folder with ``LeRobotDataset.create``. Nothing is downloaded: Hub access is
-switched off and the ``datasets`` cache lives in the temp folder too.
+folder with ``LeRobotDataset.create`` (see ``_lerobot_data.py``). Nothing is
+downloaded: Hub access is switched off and the ``datasets`` cache lives in
+the temp folder too.
 
 Frames are flat grey images whose level encodes ``(episode, step)``, and
 ``action`` / ``observation.state`` hold ``(episode, step)`` as numbers. So the
@@ -26,18 +27,21 @@ if sys.version_info < (3, 12):
 
 pytest.importorskip('lerobot')
 
+from _lerobot_data import (  # noqa: E402
+    ACTION_DIM,
+    HW,
+    VIDEO_BACKEND,
+    offline_hf,
+    write_dataset,
+)
+from _lerobot_data import action as _action  # noqa: E402
+from _lerobot_data import state as _state  # noqa: E402
+
 from stable_worldmodel.data import GoalDataset, LeRobotAdapter  # noqa: E402
 
 REPO_ID = 'swm-tests/tiny'
 CAMERA_KEY = 'observation.image'
 EP_LENGTHS = (5, 7, 4)
-FPS = 10
-HW = 16  # h264 with yuv420p needs even frame sizes.
-ACTION_DIM = 2
-
-# torchcodec needs FFmpeg shared libraries that CI runners may not have.
-# PyAV ships its own FFmpeg, so decode with it.
-VIDEO_BACKEND = 'pyav'
 
 # Flat grey frames go through h264 and the YUV <-> RGB conversion almost
 # unchanged (a couple of levels at most). Neighbouring steps differ by 10
@@ -49,80 +53,22 @@ def _grey_level(ep: int, step: int) -> int:
     return 10 + 80 * ep + 10 * step
 
 
-def _action(ep: int, step: int) -> list[float]:
-    return [float(ep), step + 0.5]
-
-
-def _state(ep: int, step: int) -> list[float]:
-    return [float(ep), float(step)]
-
-
 @pytest.fixture(scope='module', autouse=True)
 def _offline_hf(tmp_path_factory):
     """Keep every Hugging Face read offline and inside a temp folder."""
-    import datasets
-    import huggingface_hub.constants
-
-    cache = tmp_path_factory.mktemp('hf_datasets_cache')
-    with pytest.MonkeyPatch.context() as mp:
-        mp.setenv('HF_HUB_OFFLINE', '1')
-        mp.setenv('HF_DATASETS_CACHE', str(cache))
-        # Both libraries read these variables once, at import time.
-        mp.setattr(huggingface_hub.constants, 'HF_HUB_OFFLINE', True)
-        mp.setattr(datasets.config, 'HF_HUB_OFFLINE', True)
-        mp.setattr(datasets.config, 'HF_DATASETS_CACHE', cache)
-        yield
+    yield from offline_hf(tmp_path_factory)
 
 
 @pytest.fixture(scope='module')
 def tiny_root(tmp_path_factory):
     """Write the tiny dataset (one video camera, 3 episodes) to disk."""
-    from lerobot.configs.video import RGBEncoderConfig
-    from lerobot.datasets.lerobot_dataset import LeRobotDataset
-
-    root = tmp_path_factory.mktemp('lerobot') / 'ds'
-    features = {
-        CAMERA_KEY: {
-            'dtype': 'video',
-            'shape': (HW, HW, 3),
-            'names': ['height', 'width', 'channels'],
-        },
-        'observation.state': {
-            'dtype': 'float32',
-            'shape': (2,),
-            'names': ['ep', 'step'],
-        },
-        'action': {
-            'dtype': 'float32',
-            'shape': (ACTION_DIM,),
-            'names': ['ep', 'step'],
-        },
-    }
-    writer = LeRobotDataset.create(
+    return write_dataset(
+        tmp_path_factory.mktemp('lerobot') / 'ds',
         repo_id=REPO_ID,
-        fps=FPS,
-        features=features,
-        root=root,
-        use_videos=True,
-        rgb_encoder=RGBEncoderConfig(vcodec='h264'),
+        lengths=EP_LENGTHS,
+        cameras={CAMERA_KEY: 'video'},
+        level=lambda key, ep, step: _grey_level(ep, step),
     )
-    for ep, length in enumerate(EP_LENGTHS):
-        for step in range(length):
-            writer.add_frame(
-                {
-                    CAMERA_KEY: np.full(
-                        (HW, HW, 3), _grey_level(ep, step), dtype=np.uint8
-                    ),
-                    'observation.state': np.array(
-                        _state(ep, step), dtype=np.float32
-                    ),
-                    'action': np.array(_action(ep, step), dtype=np.float32),
-                    'task': 'tiny',
-                }
-            )
-        writer.save_episode(parallel_encoding=False)
-    writer.finalize()
-    return root
 
 
 def _open(tiny_root, **kwargs) -> LeRobotAdapter:
