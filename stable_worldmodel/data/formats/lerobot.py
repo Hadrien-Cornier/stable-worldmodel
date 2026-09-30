@@ -3,6 +3,11 @@
 Identified by the ``lerobot://`` scheme. Mapping ``World.collect``'s
 arbitrary info-dict to LeRobot's prescribed schema is non-trivial and
 therefore not supported as a writer here.
+
+The adapter keeps one ``LeRobotDataset``, for download, metadata, the
+episode filter and ``hf_dataset``. It reads each window itself: table
+columns straight from Arrow, and video frames with LeRobot's
+``decode_video_frames``, only for the cameras in ``keys_to_load``.
 """
 
 from __future__ import annotations
@@ -145,6 +150,17 @@ def _arrow_to_numpy(column: Any) -> np.ndarray | None:
     return flat.reshape((len(column), *row_shape))
 
 
+def _lerobot_video_utils() -> Any:
+    """LeRobot's video module, imported on first use.
+
+    Callers look up ``decode_video_frames`` on it at call time, so a patched
+    or wrapped decoder is picked up.
+    """
+    from lerobot.datasets import video_utils
+
+    return video_utils
+
+
 def _scalarize(value: Any) -> Any:
     if isinstance(value, torch.Tensor):
         if value.ndim == 0:
@@ -187,7 +203,6 @@ class LeRobotAdapter(Dataset):
         **lerobot_kwargs: Any,
     ) -> None:
         LerobotHubDataset = _import_lerobot_hub_dataset()
-        self._hub_dataset_cls = LerobotHubDataset
         self._lerobot_kwargs = dict(lerobot_kwargs)
         self.dataset = LerobotHubDataset(
             repo_id=repo_id,
@@ -215,10 +230,9 @@ class LeRobotAdapter(Dataset):
         self._full_columns: dict[str, np.ndarray] = {}
         self._arrow_columns: dict[str, Any] = {}
         self._views: dict[str, Any] = {}
+        self._video_sources: dict[tuple[str, int], tuple[Path, float]] = {}
         self._cache: dict[str, np.ndarray] = {}
-        self._window_datasets: dict[
-            tuple[tuple[int, ...], tuple[int, ...]], Any
-        ] = {}
+        self._setup_video_decoding()
 
         structure = _episode_structure(
             self._get_native_column('episode_index')
@@ -251,7 +265,12 @@ class LeRobotAdapter(Dataset):
 
     #: Caches that are cheap to rebuild. They are left out of the pickle
     #: that DataLoader workers receive, and each worker refills them on use.
-    _UNPICKLED_CACHES = ('_full_columns', '_arrow_columns', '_views')
+    _UNPICKLED_CACHES = (
+        '_full_columns',
+        '_arrow_columns',
+        '_views',
+        '_video_sources',
+    )
 
     def __getstate__(self) -> dict:
         state = self.__dict__.copy()
@@ -262,6 +281,40 @@ class LeRobotAdapter(Dataset):
         # pickled. Leave it out, as LanceDataset does.
         state['_trainer'] = None
         return state
+
+    def _setup_video_decoding(self) -> None:
+        """Read the decode settings the way ``LeRobotDataset`` does."""
+        from lerobot.utils.import_utils import get_safe_default_video_backend
+
+        meta = self.dataset.meta
+        self._video_keys = frozenset(meta.video_keys)
+        self._video_backend = (
+            self._lerobot_kwargs.get('video_backend')
+            or get_safe_default_video_backend()
+        )
+        self._return_uint8 = bool(
+            self._lerobot_kwargs.get('return_uint8', False)
+        )
+        self._depth_output_unit = self.dataset.depth_output_unit
+
+        # Depth videos are dequantized after decoding. Depth images are
+        # converted to the output unit when they were stored in another one.
+        self._depth_encoders: dict[str, Any] = {}
+        depth_videos = [k for k in meta.depth_keys if k in self._video_keys]
+        if depth_videos:
+            from lerobot.configs import DepthEncoderConfig
+
+            self._depth_encoders = {
+                key: DepthEncoderConfig.from_video_info(
+                    meta.features[key].get('info')
+                )
+                for key in depth_videos
+            }
+        self._image_depth_units = {
+            key: (meta.features[key].get('info') or {}).get('depth_unit')
+            for key in meta.depth_keys
+            if key in meta.image_keys
+        }
 
     def _get_native_keys(self) -> list[str]:
         features = self.dataset.features
@@ -373,42 +426,6 @@ class LeRobotAdapter(Dataset):
             )
         return self._views[native_key]
 
-    def _time_offsets(self, indices: tuple[int, ...]) -> list[float]:
-        return [float(idx) / self._fps for idx in indices]
-
-    def _window_dataset(
-        self,
-        observation_indices: tuple[int, ...],
-        action_indices: tuple[int, ...],
-    ) -> Any:
-        cache_key = (observation_indices, action_indices)
-        if cache_key not in self._window_datasets:
-            delta_timestamps = {}
-            for key in self._keys:
-                if key in self._SYNTHETIC_COLUMNS:
-                    continue
-                native_key = self._alias_to_native.get(key)
-                if native_key is None:
-                    continue
-                if key == 'action':
-                    delta_timestamps[native_key] = self._time_offsets(
-                        action_indices
-                    )
-                else:
-                    delta_timestamps[native_key] = self._time_offsets(
-                        observation_indices
-                    )
-
-            self._window_datasets[cache_key] = self._hub_dataset_cls(
-                repo_id=self.repo_id,
-                root=self.root,
-                episodes=self.episodes,
-                image_transforms=None,
-                delta_timestamps=delta_timestamps or None,
-                **self._lerobot_kwargs,
-            )
-        return self._window_datasets[cache_key]
-
     def _materialize_column(self, key: str) -> np.ndarray:
         if key in self._cache:
             return self._cache[key]
@@ -424,38 +441,36 @@ class LeRobotAdapter(Dataset):
             )
         return self._get_native_column(native_key)
 
-    def _get_item_value(self, item: dict[str, Any], key: str) -> Any:
-        if key == 'ep_idx':
-            return int(self._cache['ep_idx'][item['_row_idx']])
-        if key == 'step_idx':
-            return int(self._cache['step_idx'][item['_row_idx']])
+    def _window_rows(self, key: str, length: int) -> np.ndarray:
+        """Offsets, from the window start, of the rows that ``key`` reads.
 
-        native_key = self._alias_to_native[key]
-        return item[native_key]
+        ``action`` reads every row, so the actions between two observations
+        are kept. Every other column reads one row every ``frameskip`` rows.
+        """
+        step = 1 if key == 'action' else self.frameskip
+        return np.arange(0, length, step, dtype=np.int64)
 
     def _load_slice(self, ep_idx: int, start: int, end: int) -> dict:
         g_start = int(self.offsets[ep_idx] + start)
         length = int(end - start)
-        obs_indices = tuple(range(0, length, self.frameskip))
-        action_indices = tuple(range(length))
-        row = dict(self._window_dataset(obs_indices, action_indices)[g_start])
-        row['_row_idx'] = g_start
+        # As in LeRobot, a window that runs past the end of its episode
+        # repeats the last row. The episode is the one that holds g_start.
+        row_ep = int(self._cache['ep_idx'][g_start])
+        first_row = int(self.offsets[row_ep])
+        last_row = first_row + int(self.lengths[row_ep]) - 1
         steps: dict[str, Any] = {}
         for key in self._keys:
-            if key in self._SYNTHETIC_COLUMNS:
-                if key == 'ep_idx':
-                    data = torch.full(
-                        (len(obs_indices),),
-                        int(self._cache['ep_idx'][g_start]),
-                        dtype=torch.int64,
-                    )
-                else:
-                    data = torch.as_tensor(
-                        [start + idx for idx in obs_indices],
-                        dtype=torch.int64,
-                    )
+            offsets = self._window_rows(key, length)
+            if key == 'ep_idx':
+                data = torch.full((len(offsets),), row_ep, dtype=torch.int64)
+            elif key == 'step_idx':
+                # Not clamped: past the end of the episode it keeps counting.
+                data = torch.as_tensor(start + offsets, dtype=torch.int64)
             else:
-                data = self._get_item_value(row, key)
+                rows = np.clip(g_start + offsets, first_row, last_row)
+                data = self._read_window(
+                    self._alias_to_native[key], rows, row_ep
+                )
 
             if isinstance(data, torch.Tensor):
                 if data.ndim == 4 and data.shape[-1] in (1, 3):
@@ -463,6 +478,87 @@ class LeRobotAdapter(Dataset):
             steps[key] = data
 
         return self.transform(steps) if self.transform else steps
+
+    def _read_window(
+        self, native_key: str, rows: np.ndarray, row_ep: int
+    ) -> torch.Tensor:
+        """The values of ``native_key`` at ``rows``, stacked on a new axis."""
+        if native_key in self._video_keys:
+            return self._decode_video(native_key, rows, row_ep)
+
+        data = self._read_rows(native_key, rows)
+        stored_unit = self._image_depth_units.get(native_key)
+        if stored_unit is not None and stored_unit != self._depth_output_unit:
+            from lerobot.configs import DEPTH_METER_UNIT
+            from lerobot.datasets.depth_utils import MM_PER_METRE
+
+            if stored_unit == DEPTH_METER_UNIT:
+                data = data * MM_PER_METRE
+            else:
+                data = data / MM_PER_METRE
+        return data
+
+    def _read_rows(self, native_key: str, rows: np.ndarray) -> torch.Tensor:
+        column = self._arrow_column(native_key)
+        if column is not None:
+            lo, hi = int(rows.min()), int(rows.max()) + 1
+            values = _arrow_to_numpy(column.slice(lo, hi - lo))
+            if values is not None:
+                return torch.from_numpy(values[rows - lo])
+        # Images and other types go through LeRobot's transform, on a
+        # one-column view so no other column is decoded.
+        view = self._column_view(native_key)
+        return torch.stack(view[rows.tolist()][native_key])
+
+    def _decode_video(
+        self, native_key: str, rows: np.ndarray, row_ep: int
+    ) -> torch.Tensor:
+        """Decode one camera's frames at ``rows``, as LeRobot does."""
+        video_path, from_timestamp = self._video_source(
+            native_key, int(self._absolute_episode_ids[row_ep])
+        )
+        # The same float64 sums as LeRobot: where the episode starts in the
+        # video file, plus the timestamp of each row.
+        timestamps = self._read_rows('timestamp', rows).numpy()
+        query = (from_timestamp + timestamps.astype(np.float64)).tolist()
+        frames = _lerobot_video_utils().decode_video_frames(
+            video_path,
+            query,
+            self.dataset.tolerance_s,
+            self._video_backend,
+            return_uint8=self._return_uint8,
+            is_depth=native_key in self._depth_encoders,
+        )
+        depth = self._depth_encoders.get(native_key)
+        if depth is not None:
+            from lerobot.datasets.depth_utils import dequantize_depth
+
+            frames = dequantize_depth(
+                frames,
+                depth_min=depth.depth_min,
+                depth_max=depth.depth_max,
+                shift=depth.shift,
+                use_log=depth.use_log,
+                output_unit=self._depth_output_unit,
+            )
+        # LeRobot drops the time axis of a one-frame window, so a video
+        # camera gives (C, H, W) there. Kept as it was.
+        return frames.squeeze(0)
+
+    def _video_source(
+        self, native_key: str, absolute_episode: int
+    ) -> tuple[Path, float]:
+        """Video file of one camera and episode, and the episode's start."""
+        cache_key = (native_key, absolute_episode)
+        if cache_key not in self._video_sources:
+            meta = self.dataset.meta
+            video_path = self.dataset.root / meta.get_video_file_path(
+                absolute_episode, native_key
+            )
+            episode = meta.episodes[absolute_episode]
+            from_timestamp = episode[f'videos/{native_key}/from_timestamp']
+            self._video_sources[cache_key] = (video_path, from_timestamp)
+        return self._video_sources[cache_key]
 
     def get_col_data(self, col: str) -> np.ndarray:
         return self._materialize_column(col)

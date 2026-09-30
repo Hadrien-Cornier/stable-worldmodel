@@ -13,7 +13,8 @@ returns the right rows and frames, not only the right shapes:
   - ``next.reward`` is ``episode + step / 100``, and ``next.done`` is true
     on the last step of each episode
   - every camera frame is one flat grey level, given by the ``level``
-    function passed to :func:`write_dataset`
+    function passed to :func:`write_dataset`; depth frames are one flat
+    depth, given by ``depth_m``
 """
 
 from __future__ import annotations
@@ -67,6 +68,8 @@ def write_dataset(
     lengths: Sequence[int],
     cameras: Mapping[str, str],
     level: Callable[[str, int, int], int],
+    depth_cameras: Mapping[str, str] | None = None,
+    depth_m: Callable[[str, int, int], float] | None = None,
 ) -> Path:
     """Write a LeRobot v3 dataset to ``root`` and return ``root``.
 
@@ -78,9 +81,16 @@ def write_dataset(
             (PNG inside the parquet files).
         level: ``level(camera_key, episode, step)`` is the grey level
             (0-255) of that frame.
+        depth_cameras: Depth camera key to storage, ``'video'`` (LeRobot's
+            default depth encoder) or ``'image'``.
+        depth_m: ``depth_m(camera_key, episode, step)`` is the depth, in
+            metres, of that depth frame.
     """
+    from lerobot.configs import DepthEncoderConfig
     from lerobot.configs.video import RGBEncoderConfig
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
+    depth_cameras = dict(depth_cameras or {})
 
     features = {
         key: {
@@ -90,6 +100,17 @@ def write_dataset(
         }
         for key, storage in cameras.items()
     }
+    features.update(
+        {
+            key: {
+                'dtype': storage,
+                'shape': (HW, HW, 1),
+                'names': ['height', 'width', 'channels'],
+                'info': {'is_depth_map': True},
+            }
+            for key, storage in depth_cameras.items()
+        }
+    )
     features.update(
         {
             'observation.state': {
@@ -113,6 +134,7 @@ def write_dataset(
         root=root,
         use_videos=True,
         rgb_encoder=RGBEncoderConfig(vcodec='h264'),
+        depth_encoder=DepthEncoderConfig() if depth_cameras else None,
     )
     for ep, length in enumerate(lengths):
         for step in range(length):
@@ -120,6 +142,10 @@ def write_dataset(
                 key: np.full((HW, HW, 3), level(key, ep, step), dtype=np.uint8)
                 for key in cameras
             }
+            for key in depth_cameras:
+                frame[key] = np.full(
+                    (HW, HW, 1), depth_m(key, ep, step), dtype=np.float32
+                )
             frame.update(
                 {
                     'observation.state': np.array(
