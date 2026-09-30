@@ -10,7 +10,7 @@ from __future__ import annotations
 import sys
 from collections.abc import Callable, Mapping
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import numpy as np
 import torch
@@ -42,6 +42,55 @@ def _import_lerobot_hub_dataset() -> type:
         ) from exc
 
     return LerobotHubDataset
+
+
+class _EpisodeStructure(NamedTuple):
+    """Where each episode sits in the flat rows of a LeRobot dataset."""
+
+    local_episode_index: np.ndarray  # per row: episode number 0..E-1
+    step_idx: np.ndarray  # per row: step inside its episode
+    lengths: np.ndarray  # per episode: number of rows
+    offsets: np.ndarray  # per episode: first row
+    absolute_episode_ids: np.ndarray  # per episode: LeRobot episode_index
+
+
+def _episode_structure(episode_index: np.ndarray) -> _EpisodeStructure:
+    """Find the episodes in LeRobot's per-row ``episode_index`` column.
+
+    LeRobot stores the rows of one episode next to each other, so each
+    episode is one run of equal values. Episodes are numbered in the order
+    of their first row. Every step is a numpy operation, so a million rows
+    take milliseconds.
+
+    Raises:
+        ValueError: If the rows of one episode are not contiguous.
+    """
+    ids = np.asarray(episode_index).astype(np.int64, copy=False)
+    n_rows = len(ids)
+    if n_rows == 0:
+        offsets = np.zeros(0, dtype=np.int64)
+    else:
+        run_starts = np.flatnonzero(ids[1:] != ids[:-1]) + 1
+        offsets = np.concatenate(([0], run_starts)).astype(np.int64)
+    lengths = np.diff(np.append(offsets, n_rows)).astype(np.int64)
+    absolute_episode_ids = ids[offsets]
+
+    unique_ids, counts = np.unique(absolute_episode_ids, return_counts=True)
+    if (counts > 1).any():
+        split = int(unique_ids[counts > 1][0])
+        raise ValueError(
+            f'The rows of LeRobot episode {split} are not contiguous. '
+            'LeRobotAdapter needs the rows of each episode next to each '
+            'other.'
+        )
+
+    local_episode_index = np.repeat(
+        np.arange(len(offsets), dtype=np.int64), lengths
+    )
+    step_idx = np.arange(n_rows, dtype=np.int64) - np.repeat(offsets, lengths)
+    return _EpisodeStructure(
+        local_episode_index, step_idx, lengths, offsets, absolute_episode_ids
+    )
 
 
 def _scalarize(value: Any) -> Any:
@@ -117,17 +166,12 @@ class LeRobotAdapter(Dataset):
             tuple[tuple[int, ...], tuple[int, ...]], Any
         ] = {}
 
-        episode_index = self._get_native_column('episode_index')
-        (
-            local_episode_index,
-            step_idx,
-            lengths,
-            offsets,
-            absolute_episode_ids,
-        ) = self._build_episode_metadata(episode_index)
-        self._absolute_episode_ids = absolute_episode_ids
-        self._cache['ep_idx'] = local_episode_index
-        self._cache['step_idx'] = step_idx
+        structure = _episode_structure(
+            self._get_native_column('episode_index')
+        )
+        self._absolute_episode_ids = structure.absolute_episode_ids
+        self._cache['ep_idx'] = structure.local_episode_index
+        self._cache['step_idx'] = structure.step_idx
 
         if keys_to_load is None:
             keys_to_load = list(self._native_to_alias.values()) + [
@@ -139,7 +183,13 @@ class LeRobotAdapter(Dataset):
         for key in keys_to_cache or []:
             self._cache[key] = self._materialize_column(key)
 
-        super().__init__(lengths, offsets, frameskip, num_steps, transform)
+        super().__init__(
+            structure.lengths,
+            structure.offsets,
+            frameskip,
+            num_steps,
+            transform,
+        )
 
     @property
     def column_names(self) -> list[str]:
@@ -223,44 +273,6 @@ class LeRobotAdapter(Dataset):
             aliases[native] = alias
 
         return aliases
-
-    def _build_episode_metadata(
-        self,
-        absolute_episode_index: np.ndarray,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        abs_ids = absolute_episode_index.astype(np.int64)
-        unique_abs, first_idx = np.unique(abs_ids, return_index=True)
-        order = np.argsort(first_idx)
-        absolute_episode_ids = unique_abs[order]
-        counts = np.array(
-            [(abs_ids == ep_id).sum() for ep_id in absolute_episode_ids],
-            dtype=np.int64,
-        )
-
-        local_map = {
-            int(abs_id): idx for idx, abs_id in enumerate(absolute_episode_ids)
-        }
-        local_episode_index = np.array(
-            [local_map[int(abs_id)] for abs_id in abs_ids],
-            dtype=np.int64,
-        )
-
-        step_idx = np.empty_like(local_episode_index)
-        for local_ep in range(len(absolute_episode_ids)):
-            mask = local_episode_index == local_ep
-            step_idx[mask] = np.arange(mask.sum(), dtype=np.int64)
-
-        offsets = np.zeros(len(counts), dtype=np.int64)
-        if len(counts) > 1:
-            offsets[1:] = np.cumsum(counts[:-1])
-
-        return (
-            local_episode_index,
-            step_idx,
-            counts,
-            offsets,
-            absolute_episode_ids.astype(np.int64),
-        )
 
     def _get_native_column(self, native_key: str) -> np.ndarray:
         if native_key not in self._full_columns:

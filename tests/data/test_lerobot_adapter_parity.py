@@ -27,6 +27,9 @@ pytest.importorskip('lerobot')
 from _lerobot_data import VIDEO_BACKEND, offline_hf, write_dataset  # noqa: E402
 
 from stable_worldmodel.data import LeRobotAdapter  # noqa: E402
+from stable_worldmodel.data.formats.lerobot import (  # noqa: E402
+    _episode_structure,
+)
 
 REPO_ID = 'swm-tests/multi'
 FRONT = 'observation.images.front'
@@ -141,3 +144,75 @@ def test_spawn_workers_match_in_process(multi_root):
     assert len(spawned) == len(in_process) == 2
     for b, (want, got) in enumerate(zip(in_process, spawned)):
         assert_same(want, got, f'batch {b}')
+
+
+# -- Episode structure -------------------------------------------------------
+
+
+def _legacy_episode_metadata(absolute_episode_index: np.ndarray):
+    """Copy of ``LeRobotAdapter._build_episode_metadata`` before this change."""
+    abs_ids = absolute_episode_index.astype(np.int64)
+    unique_abs, first_idx = np.unique(abs_ids, return_index=True)
+    order = np.argsort(first_idx)
+    absolute_episode_ids = unique_abs[order]
+    counts = np.array(
+        [(abs_ids == ep_id).sum() for ep_id in absolute_episode_ids],
+        dtype=np.int64,
+    )
+    local_map = {
+        int(abs_id): idx for idx, abs_id in enumerate(absolute_episode_ids)
+    }
+    local_episode_index = np.array(
+        [local_map[int(abs_id)] for abs_id in abs_ids], dtype=np.int64
+    )
+    step_idx = np.empty_like(local_episode_index)
+    for local_ep in range(len(absolute_episode_ids)):
+        mask = local_episode_index == local_ep
+        step_idx[mask] = np.arange(mask.sum(), dtype=np.int64)
+    offsets = np.zeros(len(counts), dtype=np.int64)
+    if len(counts) > 1:
+        offsets[1:] = np.cumsum(counts[:-1])
+    return (
+        local_episode_index,
+        step_idx,
+        counts,
+        offsets,
+        absolute_episode_ids.astype(np.int64),
+    )
+
+
+def _assert_same_structure(episode_index: np.ndarray) -> None:
+    got = _episode_structure(episode_index)
+    want = _legacy_episode_metadata(episode_index)
+    for name, g, w in zip(got._fields, got, want):
+        assert g.dtype == w.dtype, name
+        np.testing.assert_array_equal(g, w, err_msg=name)
+
+
+@pytest.mark.parametrize(
+    'episode_index',
+    [
+        [],
+        [7],
+        [0, 0, 0],
+        [0, 1, 2],
+        [3, 3, 1, 1, 1, 8],  # an episode subset keeps LeRobot's row order
+        [2, 2, 0, 0, 0, 5, 5],
+    ],
+)
+def test_episode_structure_matches_the_old_code(episode_index):
+    _assert_same_structure(np.asarray(episode_index, dtype=np.int64))
+
+
+def test_episode_structure_matches_the_old_code_on_random_layouts():
+    rng = np.random.default_rng(0)
+    for _ in range(50):
+        n_episodes = int(rng.integers(1, 30))
+        ids = rng.permutation(100)[:n_episodes]
+        lengths = rng.integers(1, 20, size=n_episodes)
+        _assert_same_structure(np.repeat(ids, lengths))
+
+
+def test_episode_structure_rejects_an_episode_split_in_two():
+    with pytest.raises(ValueError, match='episode 0 are not contiguous'):
+        _episode_structure(np.array([0, 0, 1, 0]))
